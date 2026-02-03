@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { FolderOpen, X, Database, Loader2 } from 'lucide-react';
 import { fileSystem } from '../utils/fileSystem';
 import { db } from '../db/db';
+import { ankiConnect } from '../utils/anki';
+import { useAppStore } from '../store/useStore';
 
 interface SettingsPanelProps {
     isOpen: boolean;
@@ -12,6 +14,17 @@ interface SettingsPanelProps {
 export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose }) => {
     const [importing, setImporting] = useState(false);
     const [status, setStatus] = useState('');
+    const [decks, setDecks] = useState<string[]>([]);
+    const [models, setModels] = useState<string[]>([]);
+
+    // Select Anki settings from store
+    const ankiConnectUrl = useAppStore(state => state.ankiConnectUrl);
+    const ankiDeckName = useAppStore(state => state.ankiDeckName);
+    const ankiModelName = useAppStore(state => state.ankiModelName);
+
+    const setAnkiConnectUrl = (val: string) => useAppStore.setState({ ankiConnectUrl: val });
+    const setAnkiDeckName = (val: string) => useAppStore.setState({ ankiDeckName: val });
+    const setAnkiModelName = (val: string) => useAppStore.setState({ ankiModelName: val });
 
     const handleImport = async () => {
         try {
@@ -22,15 +35,25 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose })
             setStatus(`Scanning ${dirHandle.name}...`);
             const resources = await fileSystem.scanDirectory(dirHandle);
 
-            setStatus(`Found ${resources.length} files. Indexing...`);
+            setStatus(`Found ${resources.length} files. Filtering...`);
 
-            // Clear old resources? For now, just add new ones.
-            // await db.resources.clear(); 
+            // Filter images: only keep > 1MB (likely backgrounds/CGs)
+            const MIN_IMAGE_SIZE = 1024 * 1024; // 1MB
+            const filteredResources: typeof resources = [];
+            for (const res of resources) {
+                if (res.type === 'image') {
+                    const file = await res.handle.getFile();
+                    if (file.size < MIN_IMAGE_SIZE) {
+                        continue; // Skip small images
+                    }
+                }
+                filteredResources.push(res);
+            }
+
+            setStatus(`Importing ${filteredResources.length} resources (${resources.length - filteredResources.length} small images skipped)...`);
 
             await db.transaction('rw', db.resources, async () => {
-                for (const res of resources) {
-                    // Check if exists to avoid duplicates?
-                    // Optimized bulkAdd is better but let's just loop for safety with handles
+                for (const res of filteredResources) {
                     await db.resources.add({
                         path: res.path,
                         type: res.type,
@@ -39,7 +62,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose })
                 }
             });
 
-            setStatus(`Successfully imported ${resources.length} resources!`);
+            setStatus(`Successfully imported ${filteredResources.length} resources!`);
             setTimeout(() => setStatus(''), 2000);
         } catch (error) {
             console.error(error);
@@ -134,25 +157,120 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose })
                                     )}
                                 </div>
                             </div>
-                        </div>
 
-                        <div className="space-y-4">
-                            <button
-                                onClick={async () => {
-                                    if (confirm("This will WIPE all your progress and cards. Are you sure?")) {
-                                        setStatus('Resetting Database...');
-                                        await db.delete();
-                                        window.location.reload();
-                                    }
-                                }}
-                                className="w-full py-3 rounded-lg border border-red-500/50 text-red-400 hover:bg-red-500/10 transition-colors text-sm"
-                            >
-                                ⚠️ Reset / Wipe Database
-                            </button>
-                        </div>
+                            {/* Anki Connect Settings */}
+                            <div className="space-y-4">
+                                <h3 className="text-xl font-sans font-bold text-sakura-pink flex items-center gap-2">
+                                    <span className="text-2xl">⚡</span> Anki Connect
+                                </h3>
+                                <div className="p-6 rounded-2xl bg-white/5 border border-white/10 space-y-4">
+                                    <div className="space-y-2">
+                                        <label className="text-xs uppercase tracking-widest text-white/50">URL</label>
+                                        <div className="flex gap-2">
+                                            <input
+                                                type="text"
+                                                value={ankiConnectUrl}
+                                                onChange={(e) => setAnkiConnectUrl(e.target.value)}
+                                                className="bg-black/40 border border-white/10 rounded px-3 py-2 text-white text-sm flex-1"
+                                            />
+                                            <button
+                                                onClick={async () => {
+                                                    setStatus('Connecting to Anki...');
+                                                    try {
+                                                        await ankiConnect.requestPermission();
+                                                        const decks = await ankiConnect.getDeckNames();
+                                                        const models = await ankiConnect.getModelNames();
 
-                        <div className="text-center text-white/20 text-xs font-sans mt-8">
-                            VocabFlow v0.1.0 • Neo-Tokyo Zen
+                                                        setDecks(decks);
+                                                        setModels(models);
+
+                                                        // Auto-select defaults found
+                                                        if (!ankiDeckName && decks.includes('Default')) setAnkiDeckName('Default');
+                                                        if (!ankiModelName && models.includes('Basic')) setAnkiModelName('Basic');
+
+                                                        // Quick hack to store available options locally if needed, 
+                                                        // but for now we might just want to let user type or pick if we stored them.
+                                                        // Creating local state to show options temporarily would be better.
+                                                        // For MVP, alerting success is okay, but filling dropdowns is better.
+                                                        console.log("Decks:", decks);
+                                                        console.log("Models:", models);
+                                                        setStatus(`Connected! Found ${decks.length} decks.`);
+                                                    } catch (e: any) {
+                                                        console.error(e);
+                                                        setStatus(`Connection Failed: ${e.message}`);
+                                                    }
+                                                }}
+                                                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-white text-xs font-bold"
+                                            >
+                                                Check
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="space-y-2">
+                                        <label className="text-xs uppercase tracking-widest text-white/50">Target Deck</label>
+                                        {decks.length > 0 ? (
+                                            <select
+                                                value={ankiDeckName || ''}
+                                                onChange={(e) => setAnkiDeckName(e.target.value)}
+                                                className="w-full bg-black/40 border border-white/10 rounded px-3 py-2 text-white text-sm appearance-none cursor-pointer"
+                                            >
+                                                <option value="" disabled>Select a deck</option>
+                                                {decks.map(d => <option key={d} value={d} className="bg-gray-900">{d}</option>)}
+                                            </select>
+                                        ) : (
+                                            <input
+                                                type="text"
+                                                value={ankiDeckName || ''}
+                                                onChange={(e) => setAnkiDeckName(e.target.value)}
+                                                placeholder="Default"
+                                                className="w-full bg-black/40 border border-white/10 rounded px-3 py-2 text-white text-sm"
+                                            />
+                                        )}
+                                    </div>
+
+                                    <div className="space-y-2">
+                                        <label className="text-xs uppercase tracking-widest text-white/50">Model (Card Type)</label>
+                                        {models.length > 0 ? (
+                                            <select
+                                                value={ankiModelName || ''}
+                                                onChange={(e) => setAnkiModelName(e.target.value)}
+                                                className="w-full bg-black/40 border border-white/10 rounded px-3 py-2 text-white text-sm appearance-none cursor-pointer"
+                                            >
+                                                <option value="" disabled>Select a model</option>
+                                                {models.map(m => <option key={m} value={m} className="bg-gray-900">{m}</option>)}
+                                            </select>
+                                        ) : (
+                                            <input
+                                                type="text"
+                                                value={ankiModelName || ''}
+                                                onChange={(e) => setAnkiModelName(e.target.value)}
+                                                placeholder="Basic"
+                                                className="w-full bg-black/40 border border-white/10 rounded px-3 py-2 text-white text-sm"
+                                            />
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="space-y-4">
+                                <button
+                                    onClick={async () => {
+                                        if (confirm("This will WIPE all your progress and cards. Are you sure?")) {
+                                            setStatus('Resetting Database...');
+                                            await db.delete();
+                                            window.location.reload();
+                                        }
+                                    }}
+                                    className="w-full py-3 rounded-lg border border-red-500/50 text-red-400 hover:bg-red-500/10 transition-colors text-sm"
+                                >
+                                    ⚠️ Reset / Wipe Database
+                                </button>
+                            </div>
+
+                            <div className="text-center text-white/20 text-xs font-sans mt-8">
+                                VocabFlow v0.1.0 • Neo-Tokyo Zen
+                            </div>
                         </div>
                     </motion.div>
                 </>

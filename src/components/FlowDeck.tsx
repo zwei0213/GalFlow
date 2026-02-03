@@ -8,7 +8,25 @@ import { calculateNextReview } from '../utils/srs';
 import { Settings } from 'lucide-react';
 import { SettingsPanel } from './SettingsPanel';
 import { Howl } from 'howler';
+import { ankiConnect } from '../utils/anki';
+import { useAppStore } from '../store/useStore';
 
+const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = () => {
+            let encoded = reader.result as string;
+            // remove data:audio/ogg;base64, prefix
+            encoded = encoded.replace(/^data:(.*,)?/, '');
+            if ((encoded.length % 4) > 0) {
+                encoded += '='.repeat(4 - (encoded.length % 4));
+            }
+            resolve(encoded);
+        };
+        reader.onerror = error => reject(error);
+    });
+};
 
 export const FlowDeck: React.FC = () => {
     const cards = useLiveQuery(() => db.cards.toArray());
@@ -20,6 +38,7 @@ export const FlowDeck: React.FC = () => {
     const [showSettings, setShowSettings] = useState(false);
     const [activeIndex, setActiveIndex] = useState(0);
     const [activeSentence, setActiveSentence] = useState<Sentence | null>(null);
+    const [backgroundUrls, setBackgroundUrls] = useState<string[]>([]);
 
 
     useEffect(() => {
@@ -29,6 +48,26 @@ export const FlowDeck: React.FC = () => {
         };
         init();
     }, []);
+
+    // Load background images (only once)
+    useEffect(() => {
+        const loadBackgrounds = async () => {
+            if (!resources) return;
+            const imageResources = resources.filter(r => r.type === 'image');
+            const urls: string[] = [];
+            for (const res of imageResources) {
+                try {
+                    const file = await res.handle.getFile();
+                    urls.push(URL.createObjectURL(file));
+                } catch {
+                    // Handle might be stale if permission lost
+                }
+            }
+            setBackgroundUrls(urls);
+            console.log(`[FlowDeck] Loaded ${urls.length} background images.`);
+        };
+        loadBackgrounds();
+    }, [resources]);
 
     // Audio Player
     useEffect(() => {
@@ -180,6 +219,98 @@ export const FlowDeck: React.FC = () => {
         }
     };
 
+    const handleExportToAnki = async (card: Card, sentence?: Sentence | null) => {
+        const { ankiDeckName, ankiModelName } = useAppStore.getState();
+        if (!ankiDeckName || !ankiModelName) {
+            alert("Please configure Anki settings first (Deck and Model) in Settings.");
+            setShowSettings(true);
+            return;
+        }
+
+        try {
+            // 1. Get Fields for the selected model
+            const modelFields = await ankiConnect.getModelFieldNames(ankiModelName);
+            if (!modelFields || modelFields.length === 0) {
+                throw new Error(`Could not find fields for model: ${ankiModelName}`);
+            }
+
+            console.log(`[FlowDeck] Mapping fields for model '${ankiModelName}':`, modelFields);
+
+            // 2. Prepare Data
+            const word = card.word;
+            const content = `
+                <div style="font-size: 24px;">${card.meaning}</div>
+                <div style="color: #888; font-size: 16px;">${card.reading}</div>
+                ${sentence ? `<br><div style="font-style: italic;">${sentence.text}</div>` : ''}
+            `;
+
+            // 3. Heuristic Field Mapping
+            // Find "Front"-like field
+            const frontField = modelFields.find(f => /front|term|expression|word|kanji/i.test(f)) || modelFields[0];
+
+            // Find "Back"-like field (that isn't the front field)
+            const backField = modelFields.find(f =>
+                f !== frontField && /back|meaning|translation|definition|reading/i.test(f)
+            ) || modelFields[1] || modelFields[0]; // Fallback to 2nd field or 1st (if only 1)
+
+            // Find "Audio" specific field
+            const audioField = modelFields.find(f => /audio|sound|voice/i.test(f));
+
+            const fields: Record<string, string> = {};
+            fields[frontField] = word;
+            // If back field is same as front (e.g. 1 field note), append. Otherwise separate.
+            if (frontField === backField) {
+                fields[frontField] += "<br><br>" + content;
+            } else {
+                fields[backField] = content;
+            }
+
+            // 4. Handle Audio
+            let audioData: string | null = null;
+            let audioFilename: string | null = null;
+
+            const targetAudioPath = sentence?.audio || card.audioPath;
+
+            if (targetAudioPath && resources) {
+                // Logic to find resource
+                let res = resources.find(r => r.handle.name === targetAudioPath);
+                if (!res) {
+                    res = resources.find(r => {
+                        const nameWithoutExt = r.handle.name.substring(0, r.handle.name.lastIndexOf('.'));
+                        return nameWithoutExt === targetAudioPath;
+                    });
+                }
+                if (!res) {
+                    res = resources.find(r => r.type === 'audio' && r.handle.name.includes(targetAudioPath));
+                }
+
+                if (res) {
+                    const file = await res.handle.getFile();
+                    audioData = await fileToBase64(file);
+                    audioFilename = `vocabflow_${new Date().getTime()}_${res.handle.name.replace(/[^a-z0-9.]/gi, '_')}`;
+                }
+            }
+
+            // 5. Send to Anki
+            await ankiConnect.addNote(
+                ankiDeckName,
+                ankiModelName,
+                fields,
+                (audioData && audioFilename) ? [{
+                    filename: audioFilename,
+                    data: audioData,
+                    fields: [audioField || backField] // Play in Audio field if exists, else Back field
+                }] : undefined
+            );
+
+            alert(`Saved "${card.word}" to Anki! (Deck: ${ankiDeckName}, Model: ${ankiModelName})`);
+
+        } catch (e: any) {
+            console.error("Anki Export Error", e);
+            alert(`Anki Export Failed: ${e.message}. \nTry checking your settings.`);
+        }
+    };
+
     if (!initialized) return <div className="text-white text-center mt-20">Loading Zen Garden...</div>;
     if (!cards) return null;
 
@@ -194,6 +325,8 @@ export const FlowDeck: React.FC = () => {
                     card={card}
                     sentence={index === activeIndex ? activeSentence : null}
                     onReview={handleReview}
+                    onExport={handleExportToAnki}
+                    backgroundImageUrl={backgroundUrls.length > 0 ? backgroundUrls[index % backgroundUrls.length] : undefined}
                 />
             ))}
 
