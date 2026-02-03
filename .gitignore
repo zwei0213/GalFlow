@@ -117,3 +117,11 @@ dist
 
 # Vite
 dist
+
+# Galgame Resources and Tools (Added by Agent)
+script/
+sound/
+public/galgame_index.json
+__pycache__/
+*.py[cod]
+.vscode/
